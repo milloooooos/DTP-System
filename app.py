@@ -20,9 +20,11 @@ OUTPUT_COLUMNS = [
     "医生建议用药时长",
     "需要补充的原因",
     "来源文件",
+    "随访表类型",
 ]
 
 BRANDS = ["泰瑞沙", "利普卓", "英飞凡", "荃科得", "优赫得", "凡舒卓"]
+SPECIAL_FOLLOW_BRANDS = {"优赫得", "荃科得"}
 
 
 st.set_page_config(
@@ -108,12 +110,40 @@ def pick_sheet(sheets: dict[str, pd.DataFrame], preferred: str) -> pd.DataFrame:
     return next(iter(sheets.values()))
 
 
+def classify_follow_file(frame: pd.DataFrame, filename: str) -> str:
+    if any(brand in filename for brand in SPECIAL_FOLLOW_BRANDS):
+        return "优赫得/荃科得专属表"
+    if any(brand in filename for brand in set(BRANDS) - SPECIAL_FOLLOW_BRANDS):
+        return "通用随访表"
+
+    columns = set(frame.columns)
+    has_doctor_duration = bool({"医生建议用药时长", "医生建议服用时间"} & columns)
+    has_month_purchase = "当月是否购药" in columns
+    if has_month_purchase and not has_doctor_duration:
+        return "优赫得/荃科得专属表"
+    return "通用随访表"
+
+
 def combine_follow_files(uploaded_files) -> pd.DataFrame:
-    frames = []
+    prepared = []
     for uploaded_file in uploaded_files:
         sheets = read_excel_upload(uploaded_file)
         frame = pick_sheet(sheets, "随访底表").copy()
+        file_type = classify_follow_file(frame, uploaded_file.name)
+        frame["__brand"] = frame.apply(detect_brand, axis=1)
         frame["来源文件"] = uploaded_file.name
+        frame["随访表类型"] = file_type
+        prepared.append((file_type, frame))
+    file_types = {file_type for file_type, _ in prepared}
+    should_route_by_brand = {"优赫得/荃科得专属表", "通用随访表"}.issubset(file_types)
+
+    frames = []
+    for file_type, frame in prepared:
+        if should_route_by_brand:
+            if file_type == "优赫得/荃科得专属表":
+                frame = frame[frame["__brand"].isin(SPECIAL_FOLLOW_BRANDS)].copy()
+            else:
+                frame = frame[~frame["__brand"].isin(SPECIAL_FOLLOW_BRANDS)].copy()
         frames.append(frame)
     if not frames:
         return pd.DataFrame()
@@ -330,6 +360,7 @@ def build_issue_table(follow_df: pd.DataFrame, sales_df: pd.DataFrame, target_mo
                 "医生建议用药时长": clean_text(follow_row.get("医生建议用药时长")),
                 "需要补充的原因": reason,
                 "来源文件": clean_text(follow_row.get("来源文件")),
+                "随访表类型": clean_text(follow_row.get("随访表类型")),
             }
         )
 
@@ -365,12 +396,13 @@ follow_files = st.file_uploader(
     type=["xlsx", "xls"],
     accept_multiple_files=True,
     key="follow",
-    help="例如：一个上传优赫得/凡舒卓随访底表，另一个上传其他品种随访底表。",
+    help="可以同时上传优赫得/荃科得专属随访表和其他品种通用随访表，系统会按品牌自动分流。",
 )
 
 if not sales_file or not follow_files:
     st.info("请先上传销售底表，并至少上传一个随访底表。")
     st.write("当前支持泰瑞沙、利普卓、英飞凡、荃科得、优赫得、凡舒卓等品种字段。")
+    st.write("如果上传多份随访底表，优赫得、荃科得会自动走专属表，其他品种走通用表。")
     st.stop()
 
 try:
