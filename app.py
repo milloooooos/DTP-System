@@ -23,7 +23,7 @@ OUTPUT_COLUMNS = [
     "随访表类型",
 ]
 
-BRANDS = ["泰瑞沙", "利普卓", "英飞凡", "荃科得", "优赫得", "凡舒卓"]
+BRANDS = ["泰瑞沙", "利普卓", "英飞凡", "荃科得", "优赫得", "凡舒卓", "沃瑞沙"]
 SPECIAL_FOLLOW_BRANDS = {"优赫得", "荃科得"}
 
 
@@ -121,7 +121,9 @@ def classify_follow_file(frame: pd.DataFrame, filename: str) -> str:
     has_month_purchase = "当月是否购药" in columns
     if has_month_purchase and not has_doctor_duration:
         return "优赫得/荃科得专属表"
-    return "通用随访表"
+    if has_doctor_duration:
+        return "通用随访表"
+    return "未知随访表"
 
 
 def combine_follow_files(uploaded_files) -> pd.DataFrame:
@@ -135,7 +137,7 @@ def combine_follow_files(uploaded_files) -> pd.DataFrame:
         frame["随访表类型"] = file_type
         prepared.append((file_type, frame))
     file_types = {file_type for file_type, _ in prepared}
-    should_route_by_brand = {"优赫得/荃科得专属表", "通用随访表"}.issubset(file_types)
+    should_route_by_brand = len(prepared) > 1 and "优赫得/荃科得专属表" in file_types
 
     frames = []
     for file_type, frame in prepared:
