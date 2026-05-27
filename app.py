@@ -23,7 +23,7 @@ OUTPUT_COLUMNS = [
     "随访表类型",
 ]
 
-BRANDS = ["泰瑞沙", "利普卓", "英飞凡", "荃科得", "优赫得", "凡舒卓", "沃瑞沙"]
+BRANDS = ["泰瑞沙", "利普卓", "英飞凡", "荃科得", "优赫得", "凡舒卓"]
 SPECIAL_FOLLOW_BRANDS = {"优赫得", "荃科得"}
 
 
@@ -295,35 +295,105 @@ def purchased_in_target_month(row: pd.Series, target_month: str) -> bool | None:
     return None
 
 
-def build_issue_reason(row: pd.Series, sale: dict, target_month: str) -> str:
+def template_purchase_status(row: pd.Series, sale: dict, target_month: str) -> bool | None:
+    inferred_purchase = purchased_in_target_month(row, target_month)
+    return inferred_purchase if inferred_purchase is not None else sale.get("purchased_this_month")
+
+
+def rule_common_sales_matrix(row: pd.Series, sale: dict, target_month: str) -> str:
     reasons = []
     indication = clean_text(row.get("适应症"))
-    delay_reason = clean_text(row.get("患者延迟用药的原因"))
     no_purchase_reason = clean_text(row.get("本月未购药的原因"))
-    follow_purchase = yes_value(row.get("当月是否购药"))
-    inferred_purchase = purchased_in_target_month(row, target_month)
-    sale_purchase = sale.get("purchased_this_month")
-    purchase_status = inferred_purchase if inferred_purchase is not None else sale_purchase
+    purchase_status = template_purchase_status(row, sale, target_month)
 
     if not indication:
-        reasons.append("适应症未填写，需要补充适应症")
+        reasons.append("适应症未填写需要填写适应症")
+    if purchase_status is False and not no_purchase_reason:
+        reasons.append("患者本月还未来购药且没有存药，需填写本月未购药原因")
+    if purchase_status is True and no_purchase_reason:
+        reasons.append("患者本月已来购药，本月未购药原因应该为空")
+    return "；".join(reasons)
+
+
+def rule_yingfeifan(row: pd.Series, sale: dict, target_month: str) -> str:
+    reasons = []
+    indication = clean_text(row.get("适应症"))
+    no_purchase_reason = clean_text(row.get("本月未购药的原因"))
+    follow_purchase = yes_value(row.get("当月是否购药"))
+    purchase_status = template_purchase_status(row, sale, target_month)
+
+    if purchase_status is True and not (follow_purchase is True and not no_purchase_reason):
+        reasons.append("本月患者已购药，请检查当月是否购药列和本月未购药原因是否准确")
+    if purchase_status is False and not (follow_purchase is False and no_purchase_reason):
+        reasons.append("本月患者未购药，请检查当月是否购药列和本月未购药原因是否准确")
+    if not indication:
+        reasons.append("适应症为空需重新生成随访进行填写")
+    return "；".join(reasons)
+
+
+def expected_next_purchase(row: pd.Series, sale: dict):
+    recent_date = parse_date(row.get("会员最近一次门店购药时间"))
+    if pd.isna(recent_date):
+        recent_date = sale.get("last_sale_date", pd.NaT)
+    if pd.isna(recent_date):
+        return pd.NaT
+    brand = clean_text(row.get("__brand"))
+    days = 21 if brand in {"优赫得", "荃科得"} else 28
+    return recent_date + pd.Timedelta(days=days)
+
+
+def rule_transaction_follow(row: pd.Series, sale: dict, target_month: str) -> str:
+    reasons = []
+    brand = clean_text(row.get("__brand"))
+    no_purchase_reason = clean_text(row.get("本月未购药的原因"))
+    delay_reason = clean_text(row.get("患者延迟用药的原因"))
+    purchase_status = template_purchase_status(row, sale, target_month)
+    next_date = expected_next_purchase(row, sale)
+
+    if purchase_status is None:
+        if pd.notna(next_date):
+            return f"应做随访未做随访，该患者预计购药日期为：{next_date.strftime('%Y-%m-%d')}"
+        return "应做随访未做随访"
+
+    if pd.notna(next_date) and next_date > pd.Timestamp.today():
+        return f"预计{next_date.strftime('%Y-%m-%d')}购药，如果未购药需填写延期用药原因"
+
+    if purchase_status is False:
+        if brand in {"优赫得", "凡舒卓"} and not delay_reason:
+            reasons.append("已超期但未记录延期用药原因，需补充")
+        if not no_purchase_reason:
+            reasons.append("已超期但未记录本月未购药原因，需补充")
 
     if purchase_status is True and no_purchase_reason:
-        reasons.append("销售底表显示本月已购药，但随访记录了本月未购药原因，需核实")
+        reasons.append("需填写本月未购药原因/延期用药原因")
 
-    if purchase_status is False and not no_purchase_reason:
-        reasons.append("销售底表显示本月未购药，随访未填写本月未购药原因")
+    return "；".join(reasons)
 
-    if follow_purchase is False and not no_purchase_reason:
-        reasons.append("随访记录为当月未购药，但未填写本月未购药原因")
 
-    if follow_purchase is True and no_purchase_reason:
-        reasons.append("随访记录为当月已购药，但仍填写了本月未购药原因，需核实")
+def rule_quankede(row: pd.Series, sale: dict, target_month: str) -> str:
+    last_follow = parse_date(row.get("执行时间"))
+    second_follow = parse_date(row.get("倒数第二次门店购药时间"))
+    if pd.isna(last_follow):
+        return "还未完成随访，请本月完成两次随访且间隔大于十天"
+    if pd.isna(second_follow):
+        return f"本月未完成二次随访，请在 {(last_follow + pd.Timedelta(days=10)).strftime('%Y-%m-%d')} 完成二次随访"
+    days = abs((last_follow - second_follow).days)
+    if days < 10:
+        return f"本月已随访两次，但两次间隔＜十天，目前间隔 {days} 天，请重新生成随访"
+    return ""
 
-    if "推迟" in clean_text(row.get("用药周期状态")) and not delay_reason:
-        reasons.append("用药周期状态为推迟购药，但未填写延期用药原因")
 
-    return "；".join(dict.fromkeys(reasons))
+def build_issue_reason(row: pd.Series, sale: dict, target_month: str) -> str:
+    brand = clean_text(row.get("__brand")) or clean_text(row.get("品牌"))
+    if brand in {"泰瑞沙", "利普卓"}:
+        return rule_common_sales_matrix(row, sale, target_month)
+    if brand == "英飞凡":
+        return rule_yingfeifan(row, sale, target_month)
+    if brand in {"优赫得", "凡舒卓"}:
+        return rule_transaction_follow(row, sale, target_month)
+    if brand == "荃科得":
+        return rule_quankede(row, sale, target_month)
+    return ""
 
 
 def build_issue_table(follow_df: pd.DataFrame, sales_df: pd.DataFrame, target_month: str) -> pd.DataFrame:
@@ -333,6 +403,10 @@ def build_issue_table(follow_df: pd.DataFrame, sales_df: pd.DataFrame, target_mo
 
     rows = []
     for _, follow_row in follow_df.iterrows():
+        brand = clean_text(follow_row.get("__brand")) or clean_text(follow_row.get("品牌"))
+        if brand not in BRANDS:
+            continue
+
         if not any(
             [
                 clean_text(follow_row.get("患者姓名")),
@@ -349,7 +423,7 @@ def build_issue_table(follow_df: pd.DataFrame, sales_df: pd.DataFrame, target_mo
 
         rows.append(
             {
-                "品牌": clean_text(follow_row.get("品牌")) or clean_text(follow_row.get("__brand")) or sale.get("brand", ""),
+                "品牌": brand or sale.get("brand", ""),
                 "药房": clean_text(follow_row.get("门店")),
                 "执行时间": follow_row.get("执行时间", ""),
                 "患者姓名": clean_text(follow_row.get("患者姓名")),
