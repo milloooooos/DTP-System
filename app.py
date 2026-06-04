@@ -226,8 +226,10 @@ def build_sales_lookup(sales_df: pd.DataFrame, target_month: str) -> dict[str, d
 
     target_period = pd.Period(target_month, freq="M")
     sales_df = sales_df.copy()
+    month_columns = [column for column in sales_df.columns if re.fullmatch(r"20\d{2}-\d{2}", str(column))]
+    sales_df["__sale_month"] = sales_df["__sale_date"].dt.to_period("M")
     sales_df["__in_month"] = (
-        sales_df["__sale_date"].dt.to_period("M").eq(target_period)
+        sales_df["__sale_month"].eq(target_period)
         if "__sale_date" in sales_df and sales_df["__sale_date"].notna().any()
         else sales_df["__month_qty"].fillna(0).gt(0)
     )
@@ -243,7 +245,17 @@ def build_sales_lookup(sales_df: pd.DataFrame, target_month: str) -> dict[str, d
             "last_sale_date": row.get("__sale_date", pd.NaT),
             "last_qty": row.get("__qty", ""),
             "purchased_this_month": bool(row.get("__in_month", False)),
+            "monthly_qty": {},
+            "sale_dates": [],
         }
+        if pd.notna(row.get("__sale_month")):
+            record["monthly_qty"][row["__sale_month"]] = float(row.get("__qty", 0) or 0)
+        for month_column in month_columns:
+            qty = pd.to_numeric(pd.Series([row.get(month_column)]), errors="coerce").fillna(0).iloc[0]
+            if qty:
+                record["monthly_qty"][pd.Period(str(month_column), freq="M")] = float(qty)
+        if pd.notna(row.get("__sale_date")):
+            record["sale_dates"].append(row.get("__sale_date"))
         for key_name in ["__key_phone", "__key_member", "__key_name_store"]:
             key = clean_text(row.get(key_name))
             keys = [key]
@@ -257,9 +269,14 @@ def build_sales_lookup(sales_df: pd.DataFrame, target_month: str) -> dict[str, d
                     lookup[match_key] = record.copy()
                 else:
                     old["purchased_this_month"] = old["purchased_this_month"] or record["purchased_this_month"]
+                    for month, qty in record["monthly_qty"].items():
+                        old["monthly_qty"][month] = old["monthly_qty"].get(month, 0) + qty
+                    old["sale_dates"].extend(record["sale_dates"])
                     if pd.notna(record["last_sale_date"]):
                         old["last_sale_date"] = record["last_sale_date"]
                         old["last_qty"] = record["last_qty"]
+    for record in lookup.values():
+        record["should_have_no_purchase_reason"] = should_have_no_purchase_reason(record, target_month)
     return lookup
 
 
@@ -275,6 +292,17 @@ def find_sale(row: pd.Series, lookup: dict[str, dict]) -> dict:
     return {}
 
 
+def find_sale_by_name_store(row: pd.Series, lookup: dict[str, dict]) -> dict:
+    key = clean_text(row.get("__key_name_store"))
+    if key in lookup:
+        return lookup[key]
+    if "|" in key:
+        any_key = "ANY|" + key.split("|", 1)[1]
+        if any_key in lookup:
+            return lookup[any_key]
+    return find_sale(row, lookup)
+
+
 def yes_value(value) -> bool | None:
     text = clean_text(value)
     if text in {"是", "已购药", "有", "Y", "yes", "Yes"}:
@@ -282,6 +310,21 @@ def yes_value(value) -> bool | None:
     if text in {"否", "未购药", "无", "N", "no", "No"}:
         return False
     return None
+
+
+def should_have_no_purchase_reason(sale: dict, target_month: str) -> str:
+    monthly_qty = sale.get("monthly_qty", {})
+    if not monthly_qty:
+        return "否" if sale.get("purchased_this_month") else "是"
+
+    target = pd.Period(target_month, freq="M")
+    if monthly_qty.get(target, 0) > 0:
+        return "否"
+    for months_back in range(1, 22):
+        total = sum(monthly_qty.get(target - offset, 0) for offset in range(0, months_back + 1))
+        if total > months_back:
+            return "否"
+    return "是"
 
 
 def purchased_in_target_month(row: pd.Series, target_month: str) -> bool | None:
@@ -301,34 +344,43 @@ def template_purchase_status(row: pd.Series, sale: dict, target_month: str) -> b
 
 
 def rule_common_sales_matrix(row: pd.Series, sale: dict, target_month: str) -> str:
-    reasons = []
     indication = clean_text(row.get("适应症"))
     no_purchase_reason = clean_text(row.get("本月未购药的原因"))
-    purchase_status = template_purchase_status(row, sale, target_month)
+    should_have_reason = sale.get("should_have_no_purchase_reason", "是")
 
+    reason = ""
     if not indication:
-        reasons.append("适应症未填写需要填写适应症")
-    if purchase_status is False and not no_purchase_reason:
-        reasons.append("患者本月还未来购药且没有存药，需填写本月未购药原因")
-    if purchase_status is True and no_purchase_reason:
-        reasons.append("患者本月已来购药，本月未购药原因应该为空")
-    return "；".join(reasons)
+        reason += "适应症未填写需要填写适应症"
+    if not indication and ((should_have_reason == "是" and not no_purchase_reason) or (should_have_reason == "否" and no_purchase_reason)):
+        reason += ", "
+    if should_have_reason == "是" and not no_purchase_reason:
+        reason += "患者本月还未来购药且没有存药，需填写本月未购药原因"
+    if should_have_reason == "否" and no_purchase_reason:
+        reason += "患者本月已来购药，本月未购药原因应该为空"
+    return reason.strip()
 
 
 def rule_yingfeifan(row: pd.Series, sale: dict, target_month: str) -> str:
-    reasons = []
     indication = clean_text(row.get("适应症"))
     no_purchase_reason = clean_text(row.get("本月未购药的原因"))
     follow_purchase = yes_value(row.get("当月是否购药"))
-    purchase_status = template_purchase_status(row, sale, target_month)
+    purchase_status = bool(sale.get("purchased_this_month", False))
 
-    if purchase_status is True and not (follow_purchase is True and not no_purchase_reason):
-        reasons.append("本月患者已购药，请检查当月是否购药列和本月未购药原因是否准确")
-    if purchase_status is False and not (follow_purchase is False and no_purchase_reason):
-        reasons.append("本月患者未购药，请检查当月是否购药列和本月未购药原因是否准确")
+    purchase_reason = ""
+    if purchase_status is True:
+        if not (follow_purchase is True and not no_purchase_reason):
+            purchase_reason = "本月患者已购药，请检查当月是否购药列和本月未购药原因是否准确"
+    else:
+        if not (follow_purchase is False and no_purchase_reason):
+            purchase_reason = "本月患者未购药，请检查当月是否购药列和本月未购药原因是否准确"
+
+    indication_reason = ""
     if not indication:
-        reasons.append("适应症为空需重新生成随访进行填写")
-    return "；".join(reasons)
+        indication_reason = "适应症为空需重新生成随访进行填写"
+
+    if purchase_reason and indication_reason:
+        return purchase_reason + "；" + indication_reason
+    return purchase_reason or indication_reason
 
 
 def expected_next_purchase(row: pd.Series, sale: dict):
@@ -370,9 +422,84 @@ def rule_transaction_follow(row: pd.Series, sale: dict, target_month: str) -> st
     return "；".join(reasons)
 
 
-def rule_quankede(row: pd.Series, sale: dict, target_month: str) -> str:
-    last_follow = parse_date(row.get("执行时间"))
-    second_follow = parse_date(row.get("倒数第二次门店购药时间"))
+def transaction_actual_purchase(expected_date, follow_row: pd.Series):
+    follow_recent = parse_date(follow_row.get("会员最近一次门店购药时间"))
+    if pd.isna(expected_date):
+        return pd.NaT
+    today = pd.Timestamp.today().normalize()
+    if expected_date <= today:
+        return follow_recent
+    if pd.notna(follow_recent) and follow_recent >= expected_date - pd.Timedelta(days=5):
+        return follow_recent
+    return "日期未到"
+
+
+def purchase_status(actual_purchase, expected_date) -> str:
+    if clean_text(actual_purchase) == "日期未到":
+        return "规律"
+    actual_date = parse_date(actual_purchase)
+    if pd.isna(actual_date) or pd.isna(expected_date):
+        return ""
+    if actual_date > expected_date or actual_date < expected_date - pd.Timedelta(days=5):
+        return "超期"
+    return "规律"
+
+
+def reason_state(status: str, value, label: str) -> str:
+    text = clean_text(value)
+    if status == "规律":
+        return "" if not text else f"错误：规律但存在{label}"
+    if status == "超期":
+        return text if text else f"错误：超期但无{label}"
+    return ""
+
+
+def rule_youhede_sale(sale_row: pd.Series, follow_row: pd.Series) -> str:
+    expected = parse_date(sale_row.get("销售时间")) + pd.Timedelta(days=21)
+    actual = transaction_actual_purchase(expected, follow_row)
+    status = purchase_status(actual, expected)
+    no_purchase_state = reason_state(status, follow_row.get("本月未购药的原因"), "未购药原因")
+    delay_state = reason_state(status, follow_row.get("患者延迟用药的原因"), "延期用药原因")
+
+    if pd.notna(expected) and expected > pd.Timestamp.today().normalize() and clean_text(actual) == "日期未到":
+        return f"预计{expected.strftime('%Y-%m-%d')}购药，如果未购药需填写延期用药原因"
+    if status == "超期" and ("错误" in no_purchase_state or not no_purchase_state) and ("错误" in delay_state or not delay_state):
+        return "已超期但未记录延期用药原因，需补充"
+    actual_date = parse_date(actual)
+    if pd.notna(actual_date) and pd.notna(expected) and actual_date > expected and actual_date.month == expected.month and actual_date.year == expected.year:
+        return "" if delay_state and "错误" not in delay_state else "患者延迟用药，应填写延迟用药原因"
+    if no_purchase_state == "错误：规律但存在未购药原因":
+        return "需填写本月未购药原因/延期用药原因"
+    if no_purchase_state == "错误：超期但无未购药原因":
+        return "待观察，如果本月内未来购药，需重新生成随访填写本月未购药原因"
+    if status == "规律" and no_purchase_state:
+        return "购药规律但记录了未购药原因，需核实"
+    return ""
+
+
+def rule_fanshuzhuo_sale(sale_row: pd.Series, follow_row: pd.Series) -> str:
+    expected = parse_date(sale_row.get("销售时间")) + pd.Timedelta(days=28)
+    actual = transaction_actual_purchase(expected, follow_row)
+    status = purchase_status(actual, expected)
+    no_purchase_state = reason_state(status, follow_row.get("本月未购药的原因"), "未购药原因")
+
+    if pd.isna(parse_date(follow_row.get("执行时间"))):
+        extra = "，目前已经超期，已超期但未记录本月未购药原因，需补充" if status == "超期" else ""
+        return f"应做随访未做随访，该患者预计购药日期为：{expected.strftime('%Y-%m-%d')}{extra}"
+    if pd.notna(expected) and expected > pd.Timestamp.today().normalize() and clean_text(actual) == "日期未到":
+        return f"预计{expected.strftime('%Y-%m-%d')}购药，如果未购药需填写延期用药原因"
+    if status == "超期" and ("错误" in no_purchase_state or not no_purchase_state):
+        return "已超期但未记录本月未购药原因，需补充"
+    if no_purchase_state == "错误：规律但存在未购药原因":
+        return "需填写本月未购药原因"
+    if no_purchase_state == "错误：超期但无未购药原因":
+        return "待观察，如果本月内未来购药，需重新生成随访填写本月未购药原因"
+    if status == "规律" and no_purchase_state:
+        return "购药规律但记录了未购药原因，需核实"
+    return ""
+
+
+def rule_quankede_dates(last_follow, second_follow) -> str:
     if pd.isna(last_follow):
         return "还未完成随访，请本月完成两次随访且间隔大于十天"
     if pd.isna(second_follow):
@@ -381,6 +508,12 @@ def rule_quankede(row: pd.Series, sale: dict, target_month: str) -> str:
     if days < 10:
         return f"本月已随访两次，但两次间隔＜十天，目前间隔 {days} 天，请重新生成随访"
     return ""
+
+
+def rule_quankede(row: pd.Series, sale: dict, target_month: str) -> str:
+    last_follow = parse_date(row.get("执行时间"))
+    second_follow = parse_date(row.get("倒数第二次门店购药时间"))
+    return rule_quankede_dates(last_follow, second_follow)
 
 
 def build_issue_reason(row: pd.Series, sale: dict, target_month: str) -> str:
@@ -396,15 +529,267 @@ def build_issue_reason(row: pd.Series, sale: dict, target_month: str) -> str:
     return ""
 
 
+def first_follow_match(follow_df: pd.DataFrame, sale_row: pd.Series) -> pd.Series:
+    phone = clean_text(sale_row.get("__phone"))
+    member = clean_text(sale_row.get("__member"))
+    name_store = clean_text(sale_row.get("__key_name_store"))
+    if phone:
+        matched = follow_df[follow_df["__phone"] == phone]
+        if not matched.empty:
+            return matched.iloc[0]
+    if member:
+        matched = follow_df[follow_df["__member"] == member]
+        if not matched.empty:
+            return matched.iloc[0]
+    if name_store:
+        matched = follow_df[follow_df["__key_name_store"] == name_store]
+        if not matched.empty:
+            return matched.iloc[0]
+    return pd.Series(dtype=object)
+
+
+def build_output_row(brand: str, source_row: pd.Series, follow_row: pd.Series, reason: str) -> dict:
+    row = follow_row if not follow_row.empty else source_row
+    return {
+        "品牌": brand,
+        "药房": clean_text(row.get("门店")) or clean_text(source_row.get("药房名称")),
+        "执行时间": row.get("执行时间", ""),
+        "患者姓名": clean_text(row.get("患者姓名")) or clean_text(source_row.get("会员姓名")) or clean_text(source_row.get("开票抬头")),
+        "联系方式": clean_text(row.get("患者手机号")) or clean_text(source_row.get("会员电话")),
+        "适应症": clean_text(row.get("适应症")) or clean_text(source_row.get("适应症")),
+        "会员最近一次门店购药时间": row.get("会员最近一次门店购药时间", source_row.get("销售时间", "")),
+        "会员最近一次门店购药盒数": row.get("会员最近一次门店购药盒数", source_row.get("销售数量", "")),
+        "延期用药原因": clean_text(row.get("患者延迟用药的原因")),
+        "本月未购药的原因": clean_text(row.get("本月未购药的原因")),
+        "医生建议用药时长": clean_text(row.get("医生建议用药时长")),
+        "需要补充的原因": reason,
+        "来源文件": clean_text(row.get("来源文件")),
+        "随访表类型": clean_text(row.get("随访表类型")),
+    }
+
+
+def target_period(target_month: str) -> pd.Period:
+    return pd.Period(target_month, freq="M")
+
+
+def in_target_month(value, target_month: str) -> bool:
+    parsed = parse_date(value)
+    return pd.notna(parsed) and parsed.to_period("M") == target_period(target_month)
+
+
+def sale_patient_key(row: pd.Series) -> str:
+    key = clean_text(row.get("__key_name_store"))
+    if key and not key.endswith("|"):
+        return key
+    phone_key = clean_text(row.get("__key_phone"))
+    if phone_key and not phone_key.endswith("|"):
+        return phone_key
+    member_key = clean_text(row.get("__key_member"))
+    if member_key and not member_key.endswith("|"):
+        return member_key
+    return ""
+
+
+def person_key(row: pd.Series) -> str:
+    brand = clean_text(row.get("__brand"))
+    phone = clean_text(row.get("__phone"))
+    name = clean_text(row.get("__name")) or clean_text(row.get("患者姓名")) or clean_text(row.get("会员姓名")) or clean_text(row.get("开票抬头"))
+    if phone:
+        return brand + "|phone|" + phone
+    if name:
+        return brand + "|name|" + name
+    return ""
+
+
+def find_follow_by_sale(follow_df: pd.DataFrame, sale_row: pd.Series) -> pd.Series:
+    key = clean_text(sale_row.get("__key_name_store"))
+    if key:
+        matched = follow_df[follow_df["__key_name_store"] == key]
+        if not matched.empty:
+            return matched.sort_values("__date", ascending=False).iloc[0]
+    return first_follow_match(follow_df, sale_row)
+
+
+def find_follow_by_person(follow_df: pd.DataFrame, sale_row: pd.Series, target_month: str) -> pd.Series:
+    candidate = follow_df[follow_df["__date"].map(lambda value: in_target_month(value, target_month))].copy()
+    phone = clean_text(sale_row.get("__phone"))
+    name = clean_text(sale_row.get("__name"))
+    if phone:
+        matched = candidate[candidate["__phone"].eq(phone)]
+        if not matched.empty:
+            return matched.sort_values("__date", ascending=False).iloc[0]
+    if name:
+        matched = candidate[candidate["__name"].eq(name)]
+        if not matched.empty:
+            return matched.sort_values("__date", ascending=False).iloc[0]
+    return pd.Series(dtype=object)
+
+
+def sales_for_key(sales_df: pd.DataFrame, key: str) -> pd.DataFrame:
+    if not key or sales_df.empty:
+        return pd.DataFrame()
+    return sales_df[sales_df.apply(sale_patient_key, axis=1).eq(key)].copy()
+
+
+def has_on_time_purchase(history: pd.DataFrame, expected_date) -> bool:
+    if history.empty or pd.isna(expected_date):
+        return False
+    dates = history["__sale_date"].map(parse_date)
+    return dates.between(expected_date - pd.Timedelta(days=5), expected_date, inclusive="both").any()
+
+
+def has_later_target_purchase(history: pd.DataFrame, expected_date, target_month: str) -> bool:
+    if history.empty or pd.isna(expected_date):
+        return False
+    dates = history["__sale_date"].map(parse_date)
+    return ((dates > expected_date) & dates.dt.to_period("M").eq(target_period(target_month))).any()
+
+
+def has_target_purchase(history: pd.DataFrame, target_month: str) -> bool:
+    if history.empty:
+        return False
+    dates = history["__sale_date"].map(parse_date)
+    return dates.dt.to_period("M").eq(target_period(target_month)).any()
+
+
+def rule_stock_brand_follow(row: pd.Series, sale: dict, target_month: str) -> str:
+    indication = clean_text(row.get("适应症"))
+    no_purchase_reason = clean_text(row.get("本月未购药的原因"))
+    should_have_reason = sale.get("should_have_no_purchase_reason", "是")
+    parts = []
+    if not indication:
+        parts.append("适应症未填写需要填写适应症")
+    if should_have_reason == "是" and not no_purchase_reason:
+        parts.append("患者本月还未来购药且没有存药，需填写本月未购药原因")
+    if should_have_reason == "否" and no_purchase_reason:
+        parts.append("患者本月已来购药，本月未购药原因应该为空")
+    return ", ".join(parts)
+
+
+def rule_yingfeifan_patient(sale_row: pd.Series, follow_row: pd.Series, history: pd.DataFrame, target_month: str) -> str:
+    bought_this_month = has_target_purchase(history, target_month)
+    if follow_row.empty:
+        return "本月未完成随访，请补充随访"
+
+    no_purchase_reason = clean_text(follow_row.get("本月未购药的原因"))
+    follow_purchase = yes_value(follow_row.get("当月是否购药"))
+    indication = clean_text(follow_row.get("适应症"))
+
+    parts = []
+    if bought_this_month and not (follow_purchase is True and not no_purchase_reason):
+        parts.append("本月患者已购药，请检查当月是否购药列和本月未购药原因是否准确")
+    if not bought_this_month and not (follow_purchase is False and no_purchase_reason):
+        parts.append("本月患者未购药，请检查当月是否购药列和本月未购药原因是否准确")
+    if not indication:
+        parts.append("适应症为空需重新生成随访进行填写")
+    return "；".join(parts)
+
+
+def transaction_reason(brand: str, sale_row: pd.Series, follow_row: pd.Series, history: pd.DataFrame, target_month: str, cycle_days: int) -> str:
+    sale_date = parse_date(sale_row.get("销售时间"))
+    if pd.isna(sale_date):
+        return ""
+    expected = sale_date + pd.Timedelta(days=cycle_days)
+    if expected.to_period("M") != target_period(target_month):
+        return ""
+
+    if follow_row.empty:
+        return f"应做随访未做随访，该患者预计购药日期为：{expected.strftime('%Y-%m-%d')}"
+
+    no_purchase_reason = clean_text(follow_row.get("本月未购药的原因"))
+    delay_reason = clean_text(follow_row.get("患者延迟用药的原因"))
+    on_time = has_on_time_purchase(history, expected)
+    later_purchase = has_later_target_purchase(history, expected, target_month)
+    month_purchase = has_target_purchase(history, target_month)
+
+    if on_time:
+        if no_purchase_reason:
+            return "购药规律但记录了未购药原因，需核实"
+        return ""
+
+    if brand == "优赫得":
+        if later_purchase:
+            return "" if delay_reason else "患者延迟用药，应填写延迟用药原因"
+        if not month_purchase:
+            return "" if no_purchase_reason else "已超期但未记录未购药原因或延期用药原因，需补充"
+        return ""
+
+    if brand == "凡舒卓":
+        return "" if no_purchase_reason else "已超期但未记录本月未购药原因，需补充"
+
+    return ""
+
+
+def quankede_reason_for_patient(follow_rows: pd.DataFrame, last_sale_row: pd.Series, target_month: str) -> str:
+    if follow_rows.empty or "__date" not in follow_rows.columns:
+        return "还未完成随访，请本月完成两次随访且间隔大于十天"
+    target_rows = follow_rows[follow_rows["__date"].map(lambda value: in_target_month(value, target_month))].copy()
+    dates = target_rows["__date"].map(parse_date).dropna().sort_values(ascending=False)
+    if len(dates) == 0:
+        return "还未完成随访，请本月完成两次随访且间隔大于十天"
+    if len(dates) == 1:
+        return f"本月未完成二次随访，请在 {(dates.iloc[0] + pd.Timedelta(days=10)).strftime('%Y-%m-%d')} 完成二次随访"
+    days = abs((dates.iloc[0] - dates.iloc[1]).days)
+    if days <= 10:
+        return f"本月已随访两次，但两次间隔＜十天，目前间隔 {days} 天，请重新生成随访"
+    return ""
+
+
 def build_issue_table(follow_df: pd.DataFrame, sales_df: pd.DataFrame, target_month: str) -> pd.DataFrame:
     follow_df = add_follow_keys(follow_df)
     sales_df = add_sales_keys(sales_df, target_month) if not sales_df.empty else pd.DataFrame()
+    follow_brands = [brand for brand in follow_df["__brand"].dropna().unique() if clean_text(brand)]
+    if sales_df.empty:
+        sales_df = pd.DataFrame(columns=["__brand", "__phone", "__member", "__name", "__store", "__key_phone", "__key_member", "__key_name_store"])
+    if len(follow_brands) == 1 and not sales_df.empty:
+        sales_df.loc[sales_df["__brand"].map(clean_text).eq(""), "__brand"] = follow_brands[0]
+        sales_df["__key_phone"] = sales_df["__brand"] + "|" + sales_df["__phone"]
+        sales_df["__key_member"] = sales_df["__brand"] + "|" + sales_df["__member"]
+        sales_df["__key_name_store"] = sales_df["__brand"] + "|" + sales_df["__name"] + "|" + sales_df["__store"]
     sales_lookup = build_sales_lookup(sales_df, target_month)
 
     rows = []
+    for brand in ["优赫得", "凡舒卓", "荃科得"]:
+        brand_sales = sales_df[sales_df["__brand"].eq(brand)].copy()
+        if brand == "优赫得":
+            brand_sales = brand_sales[brand_sales["药房名称"].map(clean_text).str.contains("南充|德阳关爱|泰山路", na=False)]
+        if brand == "荃科得":
+            brand_sales = brand_sales[brand_sales["__sale_date"].map(lambda value: in_target_month(value, target_month))]
+
+        for key, history in brand_sales.groupby(brand_sales.apply(sale_patient_key, axis=1)):
+            if not key:
+                continue
+            follow_brand = follow_df[follow_df["__brand"].eq(brand)]
+            follow_rows = follow_brand[follow_brand["__key_name_store"].eq(key)].copy()
+            if follow_rows.empty:
+                sale_row = history.sort_values("__sale_date").iloc[-1]
+                follow_row = find_follow_by_sale(follow_brand, sale_row)
+            else:
+                follow_row = follow_rows.sort_values("__date", ascending=False).iloc[0]
+
+            if brand == "优赫得":
+                candidate_sales = history[history["__sale_date"].map(lambda value: pd.notna(parse_date(value)) and (parse_date(value) + pd.Timedelta(days=21)).to_period("M") == target_period(target_month))]
+                for _, sale_row in candidate_sales.iterrows():
+                    reason = transaction_reason(brand, sale_row, follow_row, history, target_month, 21)
+                    if reason:
+                        rows.append(build_output_row(brand, sale_row, follow_row, reason))
+            elif brand == "凡舒卓":
+                candidate_sales = history[history["__sale_date"].map(lambda value: pd.notna(parse_date(value)) and (parse_date(value) + pd.Timedelta(days=28)).to_period("M") == target_period(target_month))]
+                for _, sale_row in candidate_sales.iterrows():
+                    reason = transaction_reason(brand, sale_row, follow_row, history, target_month, 28)
+                    if reason:
+                        rows.append(build_output_row(brand, sale_row, follow_row, reason))
+            else:
+                if history.empty:
+                    continue
+                sale_row = history.sort_values("__sale_date").iloc[-1]
+                reason = quankede_reason_for_patient(follow_rows, sale_row, target_month)
+                if reason:
+                    rows.append(build_output_row(brand, sale_row, follow_row, reason))
+
     for _, follow_row in follow_df.iterrows():
         brand = clean_text(follow_row.get("__brand")) or clean_text(follow_row.get("品牌"))
-        if brand not in BRANDS:
+        if brand not in {"泰瑞沙", "利普卓"}:
             continue
 
         if not any(
@@ -416,29 +801,27 @@ def build_issue_table(follow_df: pd.DataFrame, sales_df: pd.DataFrame, target_mo
         ):
             continue
 
-        sale = find_sale(follow_row, sales_lookup)
-        reason = build_issue_reason(follow_row, sale, target_month)
+        sale = find_sale_by_name_store(follow_row, sales_lookup)
+        reason = rule_stock_brand_follow(follow_row, sale, target_month)
         if not reason:
             continue
 
-        rows.append(
-            {
-                "品牌": brand or sale.get("brand", ""),
-                "药房": clean_text(follow_row.get("门店")),
-                "执行时间": follow_row.get("执行时间", ""),
-                "患者姓名": clean_text(follow_row.get("患者姓名")),
-                "联系方式": clean_text(follow_row.get("患者手机号")),
-                "适应症": clean_text(follow_row.get("适应症")),
-                "会员最近一次门店购药时间": follow_row.get("会员最近一次门店购药时间", sale.get("last_sale_date", "")),
-                "会员最近一次门店购药盒数": follow_row.get("会员最近一次门店购药盒数", sale.get("last_qty", "")),
-                "延期用药原因": clean_text(follow_row.get("患者延迟用药的原因")),
-                "本月未购药的原因": clean_text(follow_row.get("本月未购药的原因")),
-                "医生建议用药时长": clean_text(follow_row.get("医生建议用药时长")),
-                "需要补充的原因": reason,
-                "来源文件": clean_text(follow_row.get("来源文件")),
-                "随访表类型": clean_text(follow_row.get("随访表类型")),
-            }
-        )
+        rows.append(build_output_row(brand, pd.Series(dtype=object), follow_row, reason))
+
+    yingfei_sales = sales_df[
+        sales_df["__brand"].eq("英飞凡")
+        & sales_df["药房名称"].map(clean_text).str.contains("晟德", na=False)
+        & sales_df["__sale_date"].map(lambda value: pd.notna(parse_date(value)) and parse_date(value) >= pd.Timestamp("2025-01-01"))
+    ].copy()
+    yingfei_follow = follow_df[follow_df["__brand"].eq("英飞凡")].copy()
+    for key, history in yingfei_sales.groupby(yingfei_sales.apply(person_key, axis=1)):
+        if not key:
+            continue
+        sale_row = history.sort_values("__sale_date").iloc[-1]
+        follow_row = find_follow_by_person(yingfei_follow, sale_row, target_month)
+        reason = rule_yingfeifan_patient(sale_row, follow_row, history, target_month)
+        if reason:
+            rows.append(build_output_row("英飞凡", sale_row, follow_row, reason))
 
     result = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
     if not result.empty:
