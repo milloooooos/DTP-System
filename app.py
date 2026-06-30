@@ -105,6 +105,16 @@ def normalize_store(value) -> str:
     return text.replace(" ", "").replace("（", "(").replace("）", ")")
 
 
+def short_store_name(value) -> str:
+    """Map full pharmacy name to short name using PHARMACY_ALIASES.
+    Used for follow-up data __store key construction (荃科得/优赫得/凡舒卓)."""
+    text = clean_text(value)
+    if text in PHARMACY_ALIASES:
+        return PHARMACY_ALIASES[text]
+    # Fallback: try normalize_store for bracket normalization
+    return normalize_store(text)
+
+
 def parse_date(value):
     if pd.isna(value) or clean_text(value) == "":
         return pd.NaT
