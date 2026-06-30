@@ -111,6 +111,14 @@ def parse_date(value):
     return pd.to_datetime(value, errors="coerce")
 
 
+def parse_datetime(value):
+    """Parse datetime preserving time component (needed for 优赫得/凡舒卓 expected dates).
+    Unlike parse_date which normalizes to midnight, this keeps the original time."""
+    if pd.isna(value) or clean_text(value) == "":
+        return pd.NaT
+    return pd.to_datetime(value, errors="coerce")
+
+
 def first_existing(df: pd.DataFrame, names: list[str]):
     for name in names:
         if name in df.columns:
@@ -547,20 +555,6 @@ def find_follow_by_person(follow_df: pd.DataFrame, sale_row: pd.Series, target_m
     return pd.Series(dtype=object)
 
 
-def has_on_time_purchase(history: pd.DataFrame, expected_date) -> bool:
-    if history.empty or pd.isna(expected_date):
-        return False
-    dates = history["__sale_date"].map(parse_date)
-    return dates.between(expected_date - pd.Timedelta(days=5), expected_date, inclusive="both").any()
-
-
-def has_later_target_purchase(history: pd.DataFrame, expected_date, target_month: str) -> bool:
-    if history.empty or pd.isna(expected_date):
-        return False
-    dates = history["__sale_date"].map(parse_date)
-    return ((dates > expected_date) & dates.dt.to_period("M").eq(target_period(target_month))).any()
-
-
 def has_target_purchase(history: pd.DataFrame, target_month: str) -> bool:
     if history.empty:
         return False
@@ -602,143 +596,168 @@ def rule_yingfeifan_patient(sale_row: pd.Series, follow_row: pd.Series, history:
     return "；".join(parts)
 
 
-def transaction_actual_purchase(expected_date, follow_row: pd.Series, history: pd.DataFrame = None):
-    """Determine actual purchase date relative to expected date.
-    If history is provided (for 优赫得/凡舒卓), use sales data to find purchase near expected date.
-    Otherwise, use follow-up data's 会员最近一次门店购药时间.
-    """
-    if pd.isna(expected_date):
-        return pd.NaT
+def compute_yh_issue(expected_dt, follow_q, follow_v, follow_o):
+    """优赫得 AE formula (per-transaction): returns (issue_reason, AD_label, AC_label).
+    expected_dt preserves time component so that expected=2026-06-29 09:01 > TODAY=2026-06-29 00:00."""
+    TODAY = pd.Timestamp.today().normalize()
+    C = expected_dt
 
-    # For 优赫得/凡舒卓: use sales history to find purchase near expected date
-    if history is not None and not history.empty:
-        dates = history["__sale_date"].map(parse_date).dropna()
-        # Find purchase within 5 days before expected date or on expected date
-        near_expected = dates[
-            dates.between(expected_date - pd.Timedelta(days=5), expected_date + pd.Timedelta(days=5), inclusive="both")
-        ]
-        if not near_expected.empty:
-            return near_expected.iloc[-1]  # Most recent near-expected purchase
-        # No purchase near expected date → check if expected is in the future
-        today = pd.Timestamp.today().normalize()
-        if expected_date > today:
-            return "日期未到"
-        # Expected date has passed but no purchase near it → overdue
-        return pd.NaT  # No purchase = overdue
+    # AA: actual purchase date logic
+    if C > TODAY:
+        # Expected in future: if follow-up purchase is near expected (±5 days), use it; else "日期未到"
+        if pd.notna(follow_q) and follow_q.normalize() >= (C - pd.Timedelta(days=5)).normalize():
+            AA = follow_q.normalize()
+        else:
+            AA = "日期未到"
+    else:
+        # Expected has passed: use follow-up purchase date if available
+        if pd.notna(follow_q):
+            AA = follow_q.normalize()
+        else:
+            AA = pd.NaT
 
-    # Original logic for 泰瑞沙/利普卓/英飞凡: use follow-up data
-    follow_recent = parse_date(follow_row.get("会员最近一次门店购药时间"))
-    today = pd.Timestamp.today().normalize()
-    if expected_date <= today:
-        return follow_recent
-    if pd.notna(follow_recent) and follow_recent >= expected_date - pd.Timedelta(days=5):
-        return follow_recent
-    return "日期未到"
+    # AB: 是否超期
+    if isinstance(AA, str) and AA == "日期未到":
+        AB = "规律"
+    elif pd.isna(AA):
+        AB = "超期"
+    else:
+        AA_date = pd.Timestamp(AA)
+        C_norm = C.normalize()
+        if AA_date > C_norm or AA_date < (C_norm - pd.Timedelta(days=5)):
+            AB = "超期"
+        else:
+            AB = "规律"
 
+    # AC: 本月未购药原因 assessment
+    v = follow_v
+    if AB == "规律":
+        AC = "" if not v else "错误：规律但存在未购药原因"
+    elif AB == "超期":
+        AC = v if v else "错误：超期但无未购药原因"
+    else:
+        AC = ""
 
-def purchase_status_label(actual_purchase, expected_date) -> str:
-    """Classify purchase timing: 规律 (on time), 超期 (overdue), or empty."""
-    if clean_text(actual_purchase) == "日期未到":
-        return "规律"
-    actual_date = parse_date(actual_purchase)
-    if pd.isna(actual_date) or pd.isna(expected_date):
-        return "超期"
-    if actual_date > expected_date or actual_date < expected_date - pd.Timedelta(days=5):
-        return "超期"
-    return "规律"
+    # AD: 延期用药原因 assessment
+    o = follow_o
+    if AB == "规律":
+        AD = "" if not o else "错误：规律但存在延期用药原因"
+    elif AB == "超期":
+        AD = o if o else "错误：超期但无延期用药原因"
+    else:
+        AD = ""
 
+    # AE: final issue determination
+    if C > TODAY and isinstance(AA, str) and AA == "日期未到":
+        return (f"预计{C.normalize().strftime('%Y-%m-%d')}购药，如果未购药需填写延期用药原因", AD, AC)
 
-def reason_state(status: str, value, label: str) -> str:
-    """Compute assessment label for 延期用药原因/未购药原因 columns."""
-    text = clean_text(value)
-    if status == "规律":
-        return "" if not text else f"错误：规律但存在{label}"
-    if status == "超期":
-        return text if text else f"错误：超期但无{label}"
-    return ""
+    ac_is_error = (not AC) or ("错误" in AC)
+    ad_is_error = (not AD) or ("错误" in AD)
 
+    if AB == "超期" and ac_is_error and ad_is_error:
+        return ("已超期但未记录未购药原因或延期用药原因，需补充", AD, AC)
 
-def rule_youhede_sale(sale_row: pd.Series, follow_row: pd.Series, history: pd.DataFrame = None) -> tuple[str, str, str]:
-    """优赫得 rule: returns (issue_reason, delay_state_label, no_purchase_state_label).
-    Uses sales history for purchase timing check if provided."""
-    expected = parse_date(sale_row.get("销售时间")) + pd.Timedelta(days=21)
-    actual = transaction_actual_purchase(expected, follow_row, history)
-    status = purchase_status_label(actual, expected)
-    no_purchase_state = reason_state(status, follow_row.get("本月未购药的原因"), "未购药原因")
-    delay_state = reason_state(status, follow_row.get("患者延迟用药的原因"), "延期用药原因")
+    if not pd.isna(AA) and not isinstance(AA, str):
+        AA_date = pd.Timestamp(AA)
+        C_norm = C.normalize()
+        if (AA_date > C_norm and AA_date > pd.Timestamp(0) and C_norm > pd.Timestamp(0) and
+            AA_date.month == C_norm.month and AA_date.year == C_norm.year):
+            if AD and "错误" not in AD:
+                return ("", AD, AC)
+            return ("患者延迟用药，应填写延迟用药原因", AD, AC)
 
-    # If expected date is in the future and purchase hasn't happened yet
-    if pd.notna(expected) and expected > pd.Timestamp.today().normalize() and clean_text(actual) == "日期未到":
-        return (f"预计{expected.strftime('%Y-%m-%d')}购药，如果未购药需填写延期用药原因", delay_state, no_purchase_state)
+    if AC == "错误：规律但存在未购药原因":
+        return ("需填写本月未购药原因/延期用药原因", AD, AC)
 
-    # No follow-up done
-    if pd.isna(parse_date(follow_row.get("执行时间"))):
-        if status == "超期":
-            return (f"应做随访未做随访，该患者预计购药日期为：{expected.strftime('%Y-%m-%d')}，目前已经超期，已超期但未记录未购药原因或延期用药原因，需补充", delay_state, no_purchase_state)
-        return (f"应做随访未做随访，该患者预计购药日期为：{expected.strftime('%Y-%m-%d')}", delay_state, no_purchase_state)
+    if AC == "错误：超期但无未购药原因":
+        return ("待观察，如果本月内未来购药，需重新生成随访填写本月未购药原因", AD, AC)
 
-    # Overdue with no purchase near expected date (actual = NaT or too early/late)
-    if status == "超期":
-        # Genuinely overdue: no purchase near expected date
-        if pd.isna(parse_date(actual)):
-            # Patient hasn't purchased near the expected date
-            has_delay_error = not delay_state or "错误" in delay_state
-            has_no_purchase_error = not no_purchase_state or "错误" in no_purchase_state
-            if has_delay_error and has_no_purchase_error:
-                return ("已超期但未记录未购药原因或延期用药原因，需补充", delay_state, no_purchase_state)
-            if has_delay_error:
-                return ("患者延迟用药，应填写延迟用药原因", delay_state, no_purchase_state)
-            if has_no_purchase_error:
-                return ("已超期但未记录未购药原因，需补充", delay_state, no_purchase_state)
-            # Has both reasons but something might still be wrong
-            return ("", delay_state, no_purchase_state)
+    if AB == "规律" and AC:
+        return ("购药规律但记录了未购药原因，需核实", AD, AC)
 
-        # Overdue but purchased late (actual date > expected)
-        actual_date = parse_date(actual)
-        if pd.notna(actual_date) and pd.notna(expected):
-            if actual_date > expected and (not delay_state or "错误" in delay_state):
-                return ("患者延迟用药，应填写延迟用药原因", delay_state, no_purchase_state)
-            if (not delay_state or "错误" in delay_state) and (not no_purchase_state or "错误" in no_purchase_state):
-                return ("已超期但未记录未购药原因或延期用药原因，需补充", delay_state, no_purchase_state)
-
-    # On-time purchase but has no_purchase_reason → need to verify
-    if status == "规律" and no_purchase_state:
-        if "错误" in no_purchase_state:
-            return ("需填写本月未购药原因/延期用药原因", delay_state, no_purchase_state)
-        return ("购药规律但记录了未购药原因，需核实", delay_state, no_purchase_state)
-
-    return ("", delay_state, no_purchase_state)
+    return ("", AD, AC)
 
 
-def rule_fanshuzhuo_sale(sale_row: pd.Series, follow_row: pd.Series, history: pd.DataFrame = None) -> tuple[str, str, str]:
-    """凡舒卓 rule: returns (issue_reason, delay_state_label, no_purchase_state_label).
-    Uses sales history for purchase timing check if provided."""
-    expected = parse_date(sale_row.get("销售时间")) + pd.Timedelta(days=28)
-    actual = transaction_actual_purchase(expected, follow_row, history)
-    status = purchase_status_label(actual, expected)
-    no_purchase_state = reason_state(status, follow_row.get("本月未购药的原因"), "未购药原因")
+def compute_fsz_issue(F, H, I_valid, follow_v):
+    """凡舒卓 M formula (per-patient) WITH Step 0: returns (issue_reason, L_label).
+    F = last sale date (normalized), H = expected date (with time), I_valid = whether phone matched in follow-up."""
+    TODAY = pd.Timestamp.today().normalize()
 
-    # No follow-up done
-    if pd.isna(parse_date(follow_row.get("执行时间"))):
-        if status == "超期":
-            return (f"应做随访未做随访，该患者预计购药日期为：{expected.strftime('%Y-%m-%d')}，目前已经超期，已超期但未记录本月未购药原因，需补充", "", no_purchase_state)
-        return (f"应做随访未做随访，该患者预计购药日期为：{expected.strftime('%Y-%m-%d')}", "", no_purchase_state)
+    # J: actual purchase date logic
+    if pd.notna(H) and H > TODAY:
+        J = "日期未到"
+    else:
+        J = F
 
-    # Expected date in the future
-    if pd.notna(expected) and expected > pd.Timestamp.today().normalize() and clean_text(actual) == "日期未到":
-        return (f"预计{expected.strftime('%Y-%m-%d')}购药，如果未购药需填写延期用药原因", "", no_purchase_state)
+    # K: 是否超期
+    if isinstance(J, str) and J == "日期未到":
+        K = "规律"
+    elif pd.isna(J):
+        K = "超期"
+    else:
+        J_date = pd.Timestamp(J) if not isinstance(J, pd.Timestamp) else J
+        H_norm = H.normalize() if pd.notna(H) else pd.NaT
+        if pd.isna(H_norm):
+            K = "超期"
+        elif J_date > H_norm or J_date < (H_norm - pd.Timedelta(days=5)):
+            K = "超期"
+        else:
+            K = "规律"
 
-    # Overdue: no_purchase_reason missing
-    if status == "超期" and (not no_purchase_state or "错误" in no_purchase_state):
-        return ("已超期但未记录本月未购药原因，需补充", "", no_purchase_state)
+    # L: 未购药原因 assessment
+    v = follow_v
+    if K == "规律":
+        L = "" if not v else "错误：规律但存在填写了未购药原因"
+    elif K == "超期":
+        L = v if v else "错误：超期但无未购药原因"
+    else:
+        L = ""
 
-    # On-time purchase but has no_purchase_reason → verify
-    if status == "规律" and no_purchase_state:
-        if "错误" in no_purchase_state:
-            return ("需填写本月未购药原因", "", no_purchase_state)
-        return ("购药规律但记录了未购药原因，需核实", "", no_purchase_state)
+    # ─── Step 0 (CRITICAL!) ───
+    # IF patient bought this month AND expected next month AND has followup AND no issue → ""
+    eom_today = (TODAY + pd.offsets.MonthEnd(0)).normalize()
+    bom_today = (TODAY - pd.offsets.MonthBegin(1) + pd.Timedelta(days=1)).normalize()
 
-    return ("", "", no_purchase_state)
+    if (pd.notna(H) and H > eom_today and
+        pd.notna(F) and F >= bom_today and F <= eom_today and
+        I_valid and not L):
+        return ("", L)
+
+    # Step 1: No follow-up match
+    if not I_valid:
+        if K == "超期":
+            return (f"应做随访未做随访，该患者预计购药日期为：{H.normalize().strftime('%Y-%m-%d')}，目前已经超期，已超期但未记录本月未购药原因，需补充", L)
+        return (f"应做随访未做随访，该患者预计购药日期为：{H.normalize().strftime('%Y-%m-%d')}", L)
+
+    # Step 2: Expected > TODAY AND J = "日期未到"
+    if pd.notna(H) and H > TODAY and isinstance(J, str) and J == "日期未到":
+        return (f"预计{H.normalize().strftime('%Y-%m-%d')}购药，如果未购药需填写延期用药原因", L)
+
+    # Step 3: K = "超期" AND (L empty or "错误")
+    l_is_error = (not L) or ("错误" in L)
+    if K == "超期" and l_is_error:
+        if not isinstance(J, str) and pd.notna(J):
+            J_date = pd.Timestamp(J) if not isinstance(J, pd.Timestamp) else J
+            H_norm = H.normalize() if pd.notna(H) else pd.NaT
+            if (pd.notna(H_norm) and J_date > H_norm and
+                J_date > pd.Timestamp(0) and H_norm > pd.Timestamp(0) and
+                J_date.month == H_norm.month and J_date.year == H_norm.year):
+                return ("患者目前已经超期，但随访未记录本月未购药原因，需补充", L)
+        return ("已超期但未记录本月未购药原因，需补充", L)
+
+    # Step 5: L = "错误：规律但存在未购药原因"
+    if L == "错误：规律但存在未购药原因":
+        return ("需填写本月未购药原因", L)
+
+    # Step 6: L = "错误：超期但无未购药原因"
+    if L == "错误：超期但无未购药原因":
+        return ("待观察，如果本月内未来购药，需重新生成随访填写本月未购药原因", L)
+
+    # Step 7: K = "规律" AND L <> ""
+    if K == "规律" and L:
+        return ("购药规律但记录了未购药原因，需核实", L)
+
+    return ("", L)
 
 
 def quankede_reason_for_patient(follow_rows: pd.DataFrame, last_sale_row: pd.Series, target_month: str) -> str:
@@ -825,107 +844,180 @@ def build_issue_table(follow_df: pd.DataFrame, sales_df: pd.DataFrame, target_mo
                 rows.append(build_output_row("泰瑞沙", pd.Series(dtype=object), follow_row, reason))
 
     # ─── 利普卓 ───
-    # Use follow-up data only for stock determination, dedup per patient+pharmacy
-    # Prefer report file rows over detail rows for overlapping patients
-    # (利普卓暂用旧逻辑，待后续单独矫正)
-    lp_follow = follow_df[follow_df["__brand"].eq("利普卓")].copy() if not follow_df.empty else pd.DataFrame()
-    if not lp_follow.empty:
-        lp_follow_sorted = lp_follow.sort_values(
-            ["__is_report", "__date"], ascending=[False, False]
-        )
-        lp_follow_dedup = lp_follow_sorted.drop_duplicates(subset=["__name", "__store"])
-        for _, follow_row in lp_follow_dedup.iterrows():
-            if not any([
-                clean_text(follow_row.get("患者姓名")),
-                clean_text(follow_row.get("患者手机号")),
-                clean_text(follow_row.get("会员号")),
-            ]):
-                continue
-            reason = rule_stock_brand_follow(follow_row, target_month)
-            if not reason:
-                continue
-            rows.append(build_output_row("利普卓", pd.Series(dtype=object), follow_row, reason))
+    # Same rolling-window approach as 泰瑞沙: use SALES data monthly totals,
+    # then XLOOKUP into follow-up data by name+short_store key.
+    # Scope filter: only include follow patients at 15 mapped pharmacies.
+    lp_sales = sales_df[sales_df["__brand"].eq("利普卓")].copy() if not sales_df.empty else pd.DataFrame()
+    if not lp_sales.empty:
+        lp_sales["__sale_month"] = lp_sales["__sale_date"].dt.to_period("M")
+        lp_sales["__qty"] = pd.to_numeric(lp_sales.get("销售数量", 1), errors="coerce").fillna(1)
+        lp_sales["__sale_key"] = lp_sales["__name"] + "|" + lp_sales["__store_raw"]
+        lp_monthly_pivot = lp_sales.groupby(["__sale_key", "__sale_month"])["__qty"].sum().reset_index()
+        lp_monthly_dict: dict[str, dict] = {}
+        for _, piv_row in lp_monthly_pivot.iterrows():
+            key = clean_text(piv_row.get("__sale_key"))
+            month = piv_row.get("__sale_month")
+            qty = float(piv_row.get("__qty", 0))
+            if key not in lp_monthly_dict:
+                lp_monthly_dict[key] = {}
+            lp_monthly_dict[key][month] = lp_monthly_dict[key].get(month, 0) + qty
+
+        lp_should_lookup = {key: should_have_from_sales(monthly, target_month) for key, monthly in lp_monthly_dict.items()}
+
+        lp_follow = follow_df[follow_df["__brand"].eq("利普卓")].copy()
+        if not lp_follow.empty:
+            lp_follow["__store_short"] = lp_follow["门店"].map(
+                lambda v: PHARMACY_SCOPE.get(clean_text(v), None)
+            )
+            lp_follow_scope = lp_follow[lp_follow["__store_short"].notna()].copy()
+            lp_follow_scope["__follow_key"] = lp_follow_scope["__name"] + "|" + lp_follow_scope["__store_short"]
+            lp_follow_sorted = lp_follow_scope.sort_values(
+                ["__is_report", "__date"], ascending=[False, False]
+            )
+            lp_follow_dedup = lp_follow_sorted.drop_duplicates(subset=["__name", "__store_short"])
+
+            for _, follow_row in lp_follow_dedup.iterrows():
+                if not clean_text(follow_row.get("患者姓名")):
+                    continue
+                follow_key = clean_text(follow_row.get("__follow_key"))
+                should_value = lp_should_lookup.get(follow_key)
+                if should_value is None:
+                    continue
+                reason = compute_tr_reason(follow_row, should_value)
+                if not reason:
+                    continue
+                rows.append(build_output_row("利普卓", pd.Series(dtype=object), follow_row, reason))
 
     # ─── 优赫得 ───
-    # Per-patient approach: for each patient, use their most recent sale record
-    # to determine expected_date, then check if they have follow-up issues
+    # Per-transaction approach (AE formula): each sale row with expected date in target month
+    # is independently processed. Follow-up matched by PHONE, not name+store.
+    # Pharmacy scope: only 南充药房 and 德阳关爱药房.
     yh_sales = sales_df[
         sales_df["__brand"].eq("优赫得")
         & sales_df["__store"].isin(["南充药房", "德阳关爱药房"])
     ].copy()
     yh_follow = follow_df[follow_df["__brand"].eq("优赫得")].copy()
-    yh_processed = set()
-    for key, history in yh_sales.groupby(yh_sales.apply(sale_patient_key, axis=1)):
-        if not key:
-            continue
-        # Dedup: each patient appears only once
-        if key in yh_processed:
-            continue
-        yh_processed.add(key)
 
-        # Use the LAST sale record to determine expected_date
-        last_sale = history.sort_values("__sale_date").iloc[-1]
-        sale_date = parse_date(last_sale.get("销售时间"))
-        if pd.isna(sale_date):
-            continue
-        expected = sale_date + pd.Timedelta(days=21)
+    if not yh_sales.empty:
+        # Add datetime-preserved sale date for expected computation
+        yh_sales["__sale_date_dt"] = yh_sales["销售时间"].map(parse_datetime)
+        yh_sales["__expected"] = yh_sales["__sale_date_dt"] + pd.Timedelta(days=21)
 
-        # Include patients whose expected_date is near the target month:
-        # May-July expected dates cover overdue, target-month, and near-future
-        if expected.to_period("M") > target_period(target_month) + 1:
-            continue
-        if expected.to_period("M") < target_period(target_month) - 1:
-            continue
+        # Filter: only rows where expected date falls in target month
+        tp = target_period(target_month)
+        yh_filtered = yh_sales[
+            yh_sales["__expected"].map(lambda x: pd.notna(x) and x.to_period("M") == tp)
+        ].copy()
 
-        # Find matching follow-up record
-        follow_rows = yh_follow[yh_follow["__key_name_store"].eq(key)].copy()
-        if not follow_rows.empty:
-            follow_row = follow_rows.sort_values("__date", ascending=False).iloc[0]
-        else:
-            follow_row = find_follow_by_sale(yh_follow, last_sale)
+        # Build phone-based follow-up lookup (keep most recent per phone, prefer report)
+        yh_follow_by_phone: dict[str, pd.Series] = {}
+        for _, frow in yh_follow.iterrows():
+            phone = clean_text(frow.get("__phone"))
+            if phone:
+                if phone not in yh_follow_by_phone:
+                    yh_follow_by_phone[phone] = frow
+                else:
+                    existing = yh_follow_by_phone[phone]
+                    # Prefer report rows; then prefer later dates
+                    existing_is_report = existing.get("__is_report", False)
+                    frow_is_report = frow.get("__is_report", False)
+                    existing_date = parse_date(existing.get("执行时间"))
+                    frow_date = parse_date(frow.get("执行时间"))
+                    if (frow_is_report and not existing_is_report) or \
+                       (frow_is_report == existing_is_report and pd.notna(frow_date) and (pd.isna(existing_date) or frow_date > existing_date)):
+                        yh_follow_by_phone[phone] = frow
 
-        issue_reason, delay_label, no_purchase_label = rule_youhede_sale(last_sale, follow_row if not follow_row.empty else pd.Series(dtype=object), history)
-        if issue_reason:
-            rows.append(build_output_row("优赫得", last_sale, follow_row, issue_reason, delay_label, no_purchase_label))
+        # Process each transaction row independently
+        yh_results = []
+        for _, sale_row in yh_filtered.iterrows():
+            phone = clean_text(sale_row.get("__phone"))
+            expected = sale_row["__expected"]
+            follow_row = yh_follow_by_phone.get(phone, pd.Series(dtype=object))
+            follow_q = parse_date(follow_row.get("会员最近一次门店购药时间")) if not follow_row.empty else pd.NaT
+            follow_v = clean_text(follow_row.get("本月未购药的原因")) if not follow_row.empty else ""
+            follow_o = clean_text(follow_row.get("患者延迟用药的原因")) if not follow_row.empty else ""
+
+            issue, ad, ac = compute_yh_issue(expected, follow_q, follow_v, follow_o)
+            if issue:
+                yh_results.append({
+                    "sale_row": sale_row,
+                    "follow_row": follow_row if not follow_row.empty else pd.Series(dtype=object),
+                    "issue": issue,
+                    "ad": ad,
+                    "ac": ac,
+                    "phone": phone,
+                    "name": clean_text(sale_row.get("__name")),
+                    "store": clean_text(sale_row.get("__store")),
+                })
+
+        # Dedup by (phone, name, store, reason)
+        yh_seen = set()
+        for r in yh_results:
+            dedup_key = (r["phone"], r["name"], r["store"], r["issue"])
+            if dedup_key in yh_seen:
+                continue
+            yh_seen.add(dedup_key)
+            rows.append(build_output_row("优赫得", r["sale_row"], r["follow_row"], r["issue"], r["ad"], r["ac"]))
 
     # ─── 凡舒卓 ───
-    # Per-patient approach: for each patient, use their most recent sale record
-    # to determine expected_date, then check if they have follow-up issues
+    # Per-patient approach (M formula WITH Step 0): group by name+store,
+    # use LATEST sale per group. Follow-up matched by PHONE for I_valid check.
+    # No pharmacy scope filter (all stores).
     fsz_sales = sales_df[sales_df["__brand"].eq("凡舒卓")].copy()
     fsz_follow = follow_df[follow_df["__brand"].eq("凡舒卓")].copy()
-    fsz_processed = set()
-    for key, history in fsz_sales.groupby(fsz_sales.apply(sale_patient_key, axis=1)):
-        if not key:
-            continue
-        # Dedup: each patient appears only once
-        if key in fsz_processed:
-            continue
-        fsz_processed.add(key)
 
-        # Use the LAST sale record to determine expected_date
-        last_sale = history.sort_values("__sale_date").iloc[-1]
-        sale_date = parse_date(last_sale.get("销售时间"))
-        if pd.isna(sale_date):
-            continue
-        expected = sale_date + pd.Timedelta(days=28)
+    if not fsz_sales.empty:
+        # Build phone-based follow-up lookup for I_valid check
+        fsz_follow_by_phone: dict[str, pd.Series] = {}
+        for _, frow in fsz_follow.iterrows():
+            phone = clean_text(frow.get("__phone"))
+            if phone:
+                if phone not in fsz_follow_by_phone:
+                    fsz_follow_by_phone[phone] = frow
+                else:
+                    existing = fsz_follow_by_phone[phone]
+                    existing_is_report = existing.get("__is_report", False)
+                    frow_is_report = frow.get("__is_report", False)
+                    existing_date = parse_date(existing.get("执行时间"))
+                    frow_date = parse_date(frow.get("执行时间"))
+                    if (frow_is_report and not existing_is_report) or \
+                       (frow_is_report == existing_is_report and pd.notna(frow_date) and (pd.isna(existing_date) or frow_date > existing_date)):
+                        fsz_follow_by_phone[phone] = frow
 
-        # Include patients whose expected_date is in or before target month + 1 month
-        # (not yet due but approaching), or overdue from recent months
-        if expected.to_period("M") > target_period(target_month) + 1:
-            continue
-        if expected.to_period("M") < target_period(target_month) - 5:
-            continue
+        # Per-patient: group by name+store, use latest sale
+        fsz_sales["__sale_key"] = fsz_sales["__name"] + "|" + fsz_sales["__store"]
+        fsz_processed = set()
+        for sale_key, group in fsz_sales.groupby("__sale_key"):
+            if not sale_key or sale_key in fsz_processed:
+                continue
+            fsz_processed.add(sale_key)
 
-        # Find matching follow-up record
-        follow_rows = fsz_follow[fsz_follow["__key_name_store"].eq(key)].copy()
-        if not follow_rows.empty:
-            follow_row = follow_rows.sort_values("__date", ascending=False).iloc[0]
-        else:
-            follow_row = find_follow_by_sale(fsz_follow, last_sale)
+            # Use latest sale record
+            latest = group.sort_values("__sale_date", ascending=False).iloc[0]
+            sale_date_dt = parse_datetime(latest.get("销售时间"))
+            sale_date_norm = parse_date(latest.get("销售时间"))
+            if pd.isna(sale_date_dt):
+                continue
 
-        issue_reason, delay_label, no_purchase_label = rule_fanshuzhuo_sale(last_sale, follow_row if not follow_row.empty else pd.Series(dtype=object), history)
-        if issue_reason:
-            rows.append(build_output_row("凡舒卓", last_sale, follow_row, issue_reason, delay_label, no_purchase_label))
+            # F = normalized sale date, H = sale_date + 28 days (preserving time)
+            F = sale_date_norm
+            H = sale_date_dt + pd.Timedelta(days=28)
+
+            # Broad expected date filter: Jan to Aug 2026
+            expected_period = H.to_period("M")
+            tp = target_period(target_month)
+            if expected_period < tp - 5 or expected_period > tp + 1:
+                continue
+
+            # Phone-based I_valid check (XLOOKUP phone in follow data)
+            phone = clean_text(latest.get("__phone"))
+            I_valid = bool(phone) and phone in fsz_follow_by_phone
+            follow_row = fsz_follow_by_phone.get(phone, pd.Series(dtype=object))
+            follow_v = clean_text(follow_row.get("本月未购药的原因")) if not follow_row.empty else ""
+
+            issue, L = compute_fsz_issue(F, H, I_valid, follow_v)
+            if issue:
+                rows.append(build_output_row("凡舒卓", latest, follow_row, issue, "", L))
 
     # ─── 荃科得 ───
     # ALL purchase patients this month must have 2 follow-ups with >10 day gap
