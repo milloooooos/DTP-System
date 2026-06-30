@@ -22,7 +22,7 @@ OUTPUT_COLUMNS = [
 ]
 
 BRANDS = ["泰瑞沙", "利普卓", "英飞凡", "荃科得", "优赫得", "凡舒卓"]
-SPECIAL_FOLLOW_BRANDS = {"优赫得"}
+SPECIAL_FOLLOW_BRANDS = {"优赫得", "荃科得"}
 # Brands whose correct list uses RAW (full) store names from follow data "门店"
 RAW_STORE_BRANDS = {"泰瑞沙", "利普卓", "英飞凡"}
 # Brands whose correct list uses ALIASED (short) store names from sales data "药房名称"
@@ -218,7 +218,7 @@ def add_follow_keys(df: pd.DataFrame) -> pd.DataFrame:
     df["__name"] = df.get("患者姓名", "").map(clean_text) if "患者姓名" in df else ""
     df["__phone"] = df.get("患者手机号", "").map(normalize_phone) if "患者手机号" in df else ""
     df["__member"] = df.get("会员号", "").map(normalize_member) if "会员号" in df else ""
-    df["__store"] = df.get("门店", "").map(normalize_store) if "门店" in df else ""
+    df["__store"] = df.get("门店", "").map(short_store_name) if "门店" in df else ""
     df["__store_raw"] = df.get("门店", "").map(clean_text) if "门店" in df else ""
     df["__date"] = df.get("执行时间", pd.NaT).map(parse_date) if "执行时间" in df else pd.NaT
     df["__is_report"] = df.get("__is_report", False) if "__is_report" in df.columns else False
@@ -761,6 +761,12 @@ def compute_fsz_issue(F, H, I_valid, follow_v):
 
 
 def quankede_reason_for_patient(follow_rows: pd.DataFrame, last_sale_row: pd.Series, target_month: str) -> str:
+    """荃科得 问题明细 formula (mirrors automation 销售底表 G column logic):
+    1. No follow-up dates in target month → "还未完成随访，请本月完成两次随访且间隔大于十天"
+    2. Only 1 follow-up date → "本月未完成二次随访，请在 YYYY-MM-DD 完成二次随访"
+    3. 2 follow-ups with interval >= 10 days → no issue (empty string)
+    4. 2 follow-ups with interval < 10 days → "间隔不足" message
+    """
     if follow_rows.empty or "__date" not in follow_rows.columns:
         return "还未完成随访，请本月完成两次随访且间隔大于十天"
     target_rows = follow_rows[follow_rows["__date"].map(lambda value: in_target_month(value, target_month))].copy()
@@ -768,9 +774,11 @@ def quankede_reason_for_patient(follow_rows: pd.DataFrame, last_sale_row: pd.Ser
     if len(dates) == 0:
         return "还未完成随访，请本月完成两次随访且间隔大于十天"
     if len(dates) == 1:
-        return "还未完成随访，请本月完成两次随访且间隔大于十天"
+        # Only 1 follow-up: second follow-up deadline = latest date + 10 days
+        deadline = dates.iloc[0] + pd.Timedelta(days=10)
+        return f"本月未完成二次随访，请在 {deadline.strftime('%Y-%m-%d')} 完成二次随访"
     days = abs((dates.iloc[0] - dates.iloc[1]).days)
-    if days <= 10:
+    if days < 10:
         return f"本月已随访两次，但两次间隔＜十天，目前间隔 {days} 天，请重新生成随访"
     return ""
 
