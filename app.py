@@ -661,8 +661,8 @@ def compute_yh_issue(expected_dt, follow_q, follow_v, follow_o):
     if C > TODAY and isinstance(AA, str) and AA == "日期未到":
         return (f"预计{C.normalize().strftime('%Y-%m-%d')}购药，如果未购药需填写延期用药原因", AD, AC)
 
-    ac_is_error = (not AC) or ("错误" in AC)
-    ad_is_error = (not AD) or ("错误" in AD)
+    ac_is_error = AC and "错误" in AC
+    ad_is_error = AD and "错误" in AD
 
     if AB == "超期" and ac_is_error and ad_is_error:
         return ("已超期但未记录未购药原因或延期用药原因，需补充", AD, AC)
@@ -744,7 +744,7 @@ def compute_fsz_issue(F, H, I_valid, follow_v):
         return (f"预计{H.normalize().strftime('%Y-%m-%d')}购药，如果未购药需填写延期用药原因", L)
 
     # Step 3: K = "超期" AND (L empty or "错误")
-    l_is_error = (not L) or ("错误" in L)
+    l_is_error = L and "错误" in L
     if K == "超期" and l_is_error:
         if not isinstance(J, str) and pd.notna(J):
             J_date = pd.Timestamp(J) if not isinstance(J, pd.Timestamp) else J
