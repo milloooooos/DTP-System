@@ -1,6 +1,4 @@
 __pycache__/
-*.pyc
-.streamlit/secrets.toml
-.env
-.DS_Store
-.workbuddy/
+*.py[cod]
+template_*.xlsx
+real_*.xlsx
