@@ -15,7 +15,7 @@ HISTORY_SALES = DATA_DIR / "sales_history.xlsx"
 HISTORY_FOLLOWUP = DATA_DIR / "followup_history.xlsx"
 PHARMACY_INFO_FILE = DATA_DIR / "pharmacy_info.csv"
 
-# 13家指定药房（销售底表「药房名称」全称）
+# 12家指定药房（销售底表「药房名称」全称）
 PHARMACY_WHITELIST = [
     "国药控股德阳有限公司泰山路关爱大药房",
     "国药控股四川医药股份有限公司遂宁药房",
@@ -27,9 +27,7 @@ PHARMACY_WHITELIST = [
     "国药控股四川医药股份有限公司西昌便民药房",
     "国药控股四川专业药房连锁有限公司攀枝花药房",
     "国药控股四川医药股份有限公司泸州药房",
-    "四川环晟大药房有限公司",
     "国药控股四川专业药房连锁有限公司雅安药房",
-    "国药控股四川专业药房连锁有限公司金牛区一环路西三段药房",
 ]
 
 SALES_REQUIRED_COLUMNS = ["销售时间", "会员电话", "药房名称", "支数"]
@@ -121,6 +119,8 @@ def standardize_followup(df: pd.DataFrame) -> pd.DataFrame:
     for column in ["执行时间", "创建日期", "计划执行日期", "末次购药日期", "患者首购日期"]:
         if column in df.columns:
             df[f"_{column}"] = pd.to_datetime(df[column], errors="coerce")
+    if "任务状态" in df.columns:
+        df["_任务状态"] = df["任务状态"].astype(str)
     if "患者年龄" in df.columns:
         df["_age"] = pd.to_numeric(df["患者年龄"], errors="coerce")
     else:
@@ -223,6 +223,7 @@ def classify_dropout(dropout: pd.DataFrame, followup_latest: pd.DataFrame) -> pd
 
 def calc_pharmacy_weekly_report(
     sales: pd.DataFrame,
+    followup_std: pd.DataFrame,
     followup_latest: pd.DataFrame,
     pharmacy: str,
     current_start: pd.Timestamp,
@@ -240,32 +241,51 @@ def calc_pharmacy_weekly_report(
     if scope.empty:
         return {}
 
+    # 该药房所有患者电话
+    pharmacy_phones = set(scope["_phone"])
+
     # 当前周新患：2024至今首购，且首购日在当前周
     since2024 = scope[scope["_sale_date"] >= pd.Timestamp("2024-01-01")]
     first_purchase = since2024.sort_values("_sale_date").drop_duplicates("_phone", keep="first")
     new_current = first_purchase[first_purchase["_sale_date"].dt.normalize().between(current_start, current_end)]
     new_count = len(new_current)
 
-    # 临床告知：新患中匹配随访底表
+    # 临床告知：新患中匹配随访底表（任意时间有随访记录即算告知）
     fu_phones = set(followup_latest["_phone"]) if not followup_latest.empty else set()
     inform_count = int(new_current["_phone"].isin(fu_phones).sum()) if new_count > 0 else 0
 
-    # 药师交代：80-90% 随即
+    # 药师交代：80-90% 随机
     random.seed(int(current_start.strftime("%Y%m%d")) + new_count)
     pharmacist_count = min(int(round(new_count * random.uniform(0.8, 0.9))), new_count) if new_count > 0 else 0
 
-    # 上周应随访
-    due_prev = calculate_due_patients(scope, prev_start, prev_end)
-    due_prev_count = len(due_prev)
-    due_prev_phones = set(due_prev["_phone"]) if due_prev_count > 0 else set()
-    # 有效随访完成
-    completed_count = len(due_prev_phones & fu_phones)
+    # 上周应随访 = 随访底表里计划执行日期在上周 且该电话属于该药房患者的任务数
+    if not followup_std.empty and "_计划执行日期" in followup_std.columns:
+        fu_prev = followup_std[
+            followup_std["_计划执行日期"].notna() &
+            followup_std["_计划执行日期"].dt.normalize().between(prev_start, prev_end)
+        ]
+        fu_prev_pharmacy = fu_prev[fu_prev["_phone"].isin(pharmacy_phones)]
+        due_prev_count = len(fu_prev_pharmacy)  # 任务数
+        due_prev_patients = set(fu_prev_pharmacy["_phone"])  # 去重患者数
+        # 已完成的有效随访 = 这些任务中已执行的
+        completed_mask = pd.Series([False] * len(fu_prev_pharmacy))
+        if "_执行时间" in fu_prev_pharmacy.columns:
+            completed_mask = fu_prev_pharmacy["_执行时间"].notna()
+        if "_任务状态" in fu_prev_pharmacy.columns:
+            completed_mask = completed_mask | (fu_prev_pharmacy["_任务状态"].astype(str).str.contains("完成|已执行", na=False))
+        completed_count = int(completed_mask.sum())
+    else:
+        due_prev_count = 0
+        completed_count = 0
+        due_prev_patients = set()
 
-    # 脱落：上周应随访但上周未购药 = 上周应购未购
+    # 脱落：上周有计划随访任务 但 上周未购药的患者
     prev_sale_phones = set(scope[scope["_sale_date"].dt.normalize().between(prev_start, prev_end)]["_phone"])
-    dropout = due_prev[~due_prev["_phone"].isin(prev_sale_phones)].copy()
+    dropout_phones = due_prev_patients - prev_sale_phones
+    dropout_count = len(dropout_phones)
+    # 构造 dropout DataFrame 供 classify_dropout 使用
+    dropout = pd.DataFrame({"_phone": list(dropout_phones)}) if dropout_phones else pd.DataFrame()
     dropout_enriched = classify_dropout(dropout, followup_latest)
-    dropout_count = len(dropout_enriched)
 
     # 当前周购药集合（用于各分类的回购计算）
     cur_sale_phones = set(scope[scope["_sale_date"].dt.normalize().between(current_start, current_end)]["_phone"])
@@ -626,7 +646,7 @@ def main() -> None:
         rows = []
         for ph in pharmacies:
             info = get_pharmacy_row_info(ph, pharmacy_info)
-            metrics = calc_pharmacy_weekly_report(sales_std, followup_latest, ph, cur_start, cur_end)
+            metrics = calc_pharmacy_weekly_report(sales_std, followup_std, followup_latest, ph, cur_start, cur_end)
             row = {
                 "DTP经理": info["DTP经理"],
                 "省份": info["省份"],
