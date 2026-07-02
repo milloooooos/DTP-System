@@ -15,6 +15,23 @@ HISTORY_SALES = DATA_DIR / "sales_history.xlsx"
 HISTORY_FOLLOWUP = DATA_DIR / "followup_history.xlsx"
 PHARMACY_INFO_FILE = DATA_DIR / "pharmacy_info.csv"
 
+# 13家指定药房（销售底表「药房名称」全称）
+PHARMACY_WHITELIST = [
+    "国药控股德阳有限公司泰山路关爱大药房",
+    "国药控股四川医药股份有限公司遂宁药房",
+    "国药康禾成都医药有限公司高新区和盛东街分公司",
+    "国药控股四川专业药房连锁有限公司达州药房",
+    "国药控股广元医药有限公司关爱大药房",
+    "国药控股四川专业药房连锁有限公司资阳药房",
+    "四川省晟德药房有限公司",
+    "国药控股四川医药股份有限公司西昌便民药房",
+    "国药控股四川专业药房连锁有限公司攀枝花药房",
+    "国药控股四川医药股份有限公司泸州药房",
+    "四川环晟大药房有限公司",
+    "国药控股四川专业药房连锁有限公司雅安药房",
+    "国药控股四川专业药房连锁有限公司金牛区一环路西三段药房",
+]
+
 SALES_REQUIRED_COLUMNS = ["销售时间", "会员电话", "药房名称", "支数"]
 FOLLOWUP_REQUIRED_COLUMNS = ["电话号码"]
 FOLLOWUP_MATCH_COLUMNS = ["电话号码", "会员电话", "电话"]
@@ -491,6 +508,11 @@ def main() -> None:
         use_history = st.checkbox("合并 data 目录中的历史数据", value=True)
 
         st.markdown("---")
+        st.caption(f"📌 当前只统计以下 {len(PHARMACY_WHITELIST)} 家药房：")
+        for ph in PHARMACY_WHITELIST:
+            st.caption(f"• {ph}")
+
+        st.markdown("---")
         st.header("🏪 药房信息配置（可选）")
         pharmacy_info_file = st.file_uploader("药房信息 CSV", type=["csv"], key="pharmacy_info",
                                               help="列：药店名称, DTP经理, 省份, 城市。未上传则自动识别。")
@@ -523,6 +545,19 @@ def main() -> None:
     # -- 标准化 --
     sales_std = standardize_sales(sales)
     followup_std = standardize_followup(followup)
+
+    # 只保留13家指定药房
+    whitelist_set = set(PHARMACY_WHITELIST)
+    sales_std = sales_std[sales_std["_pharmacy"].isin(whitelist_set)].copy()
+    if sales_std.empty:
+        st.error("销售底表中未找到13家指定药房的数据，请检查药房名称是否完全匹配。")
+        st.error(f"指定药房：{PHARMACY_WHITELIST}")
+        st.error(f"销售底表中的药房：{sorted(sales_std['_pharmacy'].unique().tolist())}")
+        st.stop()
+
+    # 随访底表只保留13家药房相关的电话（通过电话匹配，不依赖药房名列）
+    sales_phones = set(sales_std["_phone"])
+    followup_std = followup_std[followup_std["_phone"].isin(sales_phones)].copy()
     followup_latest = latest_followup_by_phone(followup_std)
 
     pharmacies = sorted([p for p in sales_std["_pharmacy"].dropna().unique().tolist() if p])
