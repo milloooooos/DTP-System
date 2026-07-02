@@ -95,7 +95,19 @@ def standardize_sales(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["_sale_date"] = pd.NaT
     if "支数" in df.columns:
-        df["_units"] = pd.to_numeric(df["支数"], errors="coerce")
+        raw_units = pd.to_numeric(df["支数"], errors="coerce")
+        # 商品代码含 CL → 支数不变；不含 CL → 支数 × 2（1盒=2支）
+        product_col = None
+        for col in ["商品代码", "商品编码", "产品代码", "SKU"]:
+            if col in df.columns:
+                product_col = col
+                break
+        if product_col:
+            is_cl = df[product_col].astype(str).str.contains("CL", case=False, na=False)
+            df["_units"] = raw_units * 2
+            df.loc[is_cl, "_units"] = raw_units[is_cl]
+        else:
+            df["_units"] = raw_units
     else:
         df["_units"] = np.nan
     df = df[df["_phone"].ne("") & df["_sale_date"].notna()]
@@ -167,23 +179,38 @@ def contains_any(series: pd.Series, keywords: list[str]) -> pd.Series:
 # ---------------------------------------------------------------------------
 
 def calculate_due_patients(sales_scope: pd.DataFrame, period_start: pd.Timestamp, period_end: pd.Timestamp) -> pd.DataFrame:
-    """根据购药间隔推算某时间段内应随访的患者"""
+    """
+    根据购药间隔推算某时间段内应随访的患者。
+    - 有≥2次购药记录：用历史间隔 / 支数 推算下次购药日期
+    - 只有1次购药记录：默认每支管28天，推算下次购药日期
+    """
     rows = []
     for phone, group in sales_scope.sort_values("_sale_date").groupby("_phone"):
         group = group[group["_sale_date"].notna()].copy()
-        if len(group) < 2:
+        if len(group) == 0:
             continue
-        group["_prev_date"] = group["_sale_date"].shift(1)
-        group["_gap"] = (group["_sale_date"] - group["_prev_date"]).dt.days
-        valid = group[(group["_gap"] > 0) & (group["_units"] > 0)].copy()
-        if valid.empty:
-            continue
-        last = valid.iloc[-1].copy()
-        avg_days = last["_gap"] / last["_units"]
-        expected = last["_sale_date"] + pd.to_timedelta(avg_days * last["_units"], unit="D")
+        last = group.iloc[-1].copy()
+        units = last["_units"] if pd.notna(last["_units"]) else 1
+        units = max(units, 1)  # 防止0支
+
+        if len(group) >= 2:
+            group["_prev_date"] = group["_sale_date"].shift(1)
+            group["_gap"] = (group["_sale_date"] - group["_prev_date"]).dt.days
+            valid = group[(group["_gap"] > 0) & (group["_units"] > 0)].copy()
+            if not valid.empty:
+                # 用最近一次间隔推算
+                avg_days_per_unit = valid.iloc[-1]["_gap"] / max(valid.iloc[-1]["_units"], 1)
+            else:
+                avg_days_per_unit = 28.0  #  fallback
+        else:
+            # 只有1次购药：默认每支28天
+            avg_days_per_unit = 28.0
+
+        days_supply = avg_days_per_unit * units
+        expected = last["_sale_date"] + pd.to_timedelta(days_supply, unit="D")
         if period_start <= expected.normalize() <= period_end:
             last["_expected_next_date"] = expected
-            last["_avg_days_per_unit"] = avg_days
+            last["_avg_days_per_unit"] = avg_days_per_unit
             rows.append(last)
     if not rows:
         cols = list(sales_scope.columns) + ["_expected_next_date", "_avg_days_per_unit"]
@@ -223,7 +250,6 @@ def classify_dropout(dropout: pd.DataFrame, followup_latest: pd.DataFrame) -> pd
 
 def calc_pharmacy_weekly_report(
     sales: pd.DataFrame,
-    followup_std: pd.DataFrame,
     followup_latest: pd.DataFrame,
     pharmacy: str,
     current_start: pd.Timestamp,
@@ -241,9 +267,6 @@ def calc_pharmacy_weekly_report(
     if scope.empty:
         return {}
 
-    # 该药房所有患者电话
-    pharmacy_phones = set(scope["_phone"])
-
     # 当前周新患：2024至今首购，且首购日在当前周
     since2024 = scope[scope["_sale_date"] >= pd.Timestamp("2024-01-01")]
     first_purchase = since2024.sort_values("_sale_date").drop_duplicates("_phone", keep="first")
@@ -258,34 +281,20 @@ def calc_pharmacy_weekly_report(
     random.seed(int(current_start.strftime("%Y%m%d")) + new_count)
     pharmacist_count = min(int(round(new_count * random.uniform(0.8, 0.9))), new_count) if new_count > 0 else 0
 
-    # 上周应随访 = 随访底表里计划执行日期在上周 且该电话属于该药房患者的任务数
-    if not followup_std.empty and "_计划执行日期" in followup_std.columns:
-        fu_prev = followup_std[
-            followup_std["_计划执行日期"].notna() &
-            followup_std["_计划执行日期"].dt.normalize().between(prev_start, prev_end)
-        ]
-        fu_prev_pharmacy = fu_prev[fu_prev["_phone"].isin(pharmacy_phones)]
-        due_prev_count = len(fu_prev_pharmacy)  # 任务数
-        due_prev_patients = set(fu_prev_pharmacy["_phone"])  # 去重患者数
-        # 已完成的有效随访 = 这些任务中已执行的
-        completed_mask = pd.Series([False] * len(fu_prev_pharmacy))
-        if "_执行时间" in fu_prev_pharmacy.columns:
-            completed_mask = fu_prev_pharmacy["_执行时间"].notna()
-        if "_任务状态" in fu_prev_pharmacy.columns:
-            completed_mask = completed_mask | (fu_prev_pharmacy["_任务状态"].astype(str).str.contains("完成|已执行", na=False))
-        completed_count = int(completed_mask.sum())
-    else:
-        due_prev_count = 0
-        completed_count = 0
-        due_prev_patients = set()
+    # 上周应随访 = 根据购药记录推算，上周预计需购药的患者数
+    # 含单次购药患者（默认28天/支）
+    due_prev = calculate_due_patients(scope, prev_start, prev_end)
+    due_prev_count = len(due_prev)  # 患者人数（去重）
+    due_prev_phones = set(due_prev["_phone"]) if due_prev_count > 0 else set()
 
-    # 脱落：上周有计划随访任务 但 上周未购药的患者
+    # 有效随访完成 = 应随访患者中，随访底表有记录的人数
+    completed_count = len(due_prev_phones & fu_phones)
+
+    # 脱落：上周应随访 但 上周未购药的患者
     prev_sale_phones = set(scope[scope["_sale_date"].dt.normalize().between(prev_start, prev_end)]["_phone"])
-    dropout_phones = due_prev_patients - prev_sale_phones
-    dropout_count = len(dropout_phones)
-    # 构造 dropout DataFrame 供 classify_dropout 使用
-    dropout = pd.DataFrame({"_phone": list(dropout_phones)}) if dropout_phones else pd.DataFrame()
+    dropout = due_prev[~due_prev["_phone"].isin(prev_sale_phones)].copy()
     dropout_enriched = classify_dropout(dropout, followup_latest)
+    dropout_count = len(dropout_enriched)
 
     # 当前周购药集合（用于各分类的回购计算）
     cur_sale_phones = set(scope[scope["_sale_date"].dt.normalize().between(current_start, current_end)]["_phone"])
@@ -646,7 +655,7 @@ def main() -> None:
         rows = []
         for ph in pharmacies:
             info = get_pharmacy_row_info(ph, pharmacy_info)
-            metrics = calc_pharmacy_weekly_report(sales_std, followup_std, followup_latest, ph, cur_start, cur_end)
+            metrics = calc_pharmacy_weekly_report(sales_std, followup_latest, ph, cur_start, cur_end)
             row = {
                 "DTP经理": info["DTP经理"],
                 "省份": info["省份"],
