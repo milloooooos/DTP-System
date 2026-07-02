@@ -386,8 +386,8 @@ def main() -> None:
                         break
 
     if quick_week:
-        default_start = quick_week[0]
-        default_end = quick_week[1]
+        default_start = max(quick_week[0], min_date)
+        default_end = min(quick_week[1], max_date)
     else:
         default_start = max(min_date, pd.Timestamp("2024-01-01").date())
         default_end = max_date
