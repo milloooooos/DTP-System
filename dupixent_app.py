@@ -332,7 +332,7 @@ def main() -> None:
         sales_file = st.file_uploader("上传销售底表 Excel", type=["xlsx", "xls"], key="sales")
         followup_file = st.file_uploader("上传随访底表 Excel", type=["xlsx", "xls"], key="followup")
         use_history = st.checkbox("合并 data 目录中的历史数据", value=True)
-        seed = st.number_input("药师交代人数随机种子", min_value=1, max_value=999999, value=20260701)
+        seed = st.number_input("药师交代人数随机种子", min_value=1, max_value=99999999, value=20260701)
         st.markdown("---")
         st.markdown("历史数据文件名：")
         st.code("data/sales_history.xlsx\ndata/followup_history.xlsx", language="text")
