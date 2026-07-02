@@ -220,7 +220,6 @@ def calculate_metrics(
     pharmacy: str,
     start_date,
     end_date,
-    seed: int,
 ) -> MetricResult:
     start = pd.Timestamp(start_date).normalize()
     end = pd.Timestamp(end_date).normalize()
@@ -240,8 +239,9 @@ def calculate_metrics(
     followup_phones = set(followup_latest["_phone"]) if not followup_latest.empty else set()
     informed_count = int(new_patients["_phone"].isin(followup_phones).sum())
 
-    random.seed(seed + len(new_patients) + int(start.strftime("%Y%m%d")))
+    random.seed(int(start.strftime("%Y%m%d")) + len(new_patients))
     pharmacist_first_count = int(round(len(new_patients) * random.uniform(0.8, 0.9)))
+    pharmacist_first_count = min(pharmacist_first_count, len(new_patients))
 
     due_patients = calculate_due_patients(sales_scope, start, end)
     due_phones = set(due_patients["_phone"]) if not due_patients.empty else set()
@@ -332,7 +332,6 @@ def main() -> None:
         sales_file = st.file_uploader("上传销售底表 Excel", type=["xlsx", "xls"], key="sales")
         followup_file = st.file_uploader("上传随访底表 Excel", type=["xlsx", "xls"], key="followup")
         use_history = st.checkbox("合并 data 目录中的历史数据", value=True)
-        seed = st.number_input("药师交代人数随机种子", min_value=1, max_value=99999999, value=20260701)
         st.markdown("---")
         st.markdown("历史数据文件名：")
         st.code("data/sales_history.xlsx\ndata/followup_history.xlsx", language="text")
@@ -362,19 +361,49 @@ def main() -> None:
     min_date = sales_std["_sale_date"].min().date()
     max_date = sales_std["_sale_date"].max().date()
 
-    col1, col2, col3 = st.columns([1, 1, 1.4])
-    with col1:
-        start_date = st.date_input("开始日期", value=max(min_date, pd.Timestamp("2024-01-01").date()), min_value=min_date, max_value=max_date)
-    with col2:
-        end_date = st.date_input("结束日期", value=max_date, min_value=min_date, max_value=max_date)
-    with col3:
+    st.subheader("选择统计周期")
+    col_quick, col_start, col_end, col_pharma = st.columns([1.2, 1, 1, 1.4])
+
+    with col_quick:
+        st.caption("快捷选周")
+        today = pd.Timestamp.now().normalize()
+        recent_mondays = []
+        for i in range(0, 8):
+            monday = today - pd.Timedelta(days=today.weekday() + i * 7)
+            sunday = monday + pd.Timedelta(days=6)
+            if monday.date() >= min_date:
+                label = f"{monday.strftime('%m.%d')}~{sunday.strftime('%m.%d')}"
+                recent_mondays.append((label, monday.date(), sunday.date()))
+
+        quick_week = None
+        if recent_mondays:
+            quick_labels = [m[0] for m in recent_mondays]
+            selected_label = st.selectbox("选择周", ["自定义"] + quick_labels, index=1)
+            if selected_label != "自定义":
+                for label, monday, sunday in recent_mondays:
+                    if label == selected_label:
+                        quick_week = (monday, sunday)
+                        break
+
+    if quick_week:
+        default_start = quick_week[0]
+        default_end = quick_week[1]
+    else:
+        default_start = max(min_date, pd.Timestamp("2024-01-01").date())
+        default_end = max_date
+
+    with col_start:
+        start_date = st.date_input("开始日期", value=default_start, min_value=min_date, max_value=max_date)
+    with col_end:
+        end_date = st.date_input("结束日期", value=default_end, min_value=min_date, max_value=max_date)
+    with col_pharma:
         pharmacy = st.selectbox("药房", ["全部药房"] + pharmacies)
 
     if pd.Timestamp(start_date) > pd.Timestamp(end_date):
         st.error("开始日期不能晚于结束日期。")
         st.stop()
 
-    result = calculate_metrics(sales, followup, pharmacy, start_date, end_date, int(seed))
+    result = calculate_metrics(sales, followup, pharmacy, start_date, end_date)
     display_summary = result.summary.copy()
     display_summary["展示值"] = display_summary.apply(lambda row: format_metric_value(row["指标"], row["数值"]), axis=1)
 
